@@ -130,15 +130,29 @@ def read_csv(path, cols):
 
 
 def _clean_records(df):
+    numeric_cols = {"单价", "输入数量", "计价数量", "小计", "营业额"}
     out = []
-    for rec in df.fillna("").to_dict(orient="records"):
+    for rec in df.to_dict(orient="records"):
         clean = {}
         for k, v in rec.items():
             if hasattr(v, "item"):
                 v = v.item()
+            if v is None:
+                clean[k] = None
+                continue
             if isinstance(v, float) and math.isnan(v):
-                v = ""
-            clean[k] = v
+                clean[k] = None if k in numeric_cols else ""
+                continue
+            if k in numeric_cols:
+                if str(v).strip() == "":
+                    clean[k] = None
+                else:
+                    try:
+                        clean[k] = float(v)
+                    except Exception:
+                        clean[k] = None
+            else:
+                clean[k] = "" if str(v) == "nan" else v
         out.append(clean)
     return out
 
@@ -146,19 +160,31 @@ def _clean_records(df):
 def write_csv(path, df):
     df.to_csv(path, index=False, encoding="utf-8-sig")
     if USE_SUPABASE:
-        table = TABLE_MAP.get(Path(path).name)
-        if table:
-            # Supabase/PostgREST 不能用不存在字段删除；每张表用稳定非空字段清空后重写，避免页面看似提交但数据库没变。
-            del_filter = DELETE_FILTER.get(table, "id=not.is.null")
-            rdel = requests.delete(f"{SUPABASE_URL}/rest/v1/{table}?{del_filter}", headers=SB_HEADERS, timeout=30)
-            if rdel.status_code >= 400:
-                raise RuntimeError(f"Supabase delete {table} failed: {rdel.status_code} {rdel.text[:300]}")
-            rows = _clean_records(df)
-            if rows:
-                for i in range(0, len(rows), 500):
-                    rins = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SB_HEADERS, data=json.dumps(rows[i:i+500], ensure_ascii=False), timeout=30)
-                    if rins.status_code >= 400:
-                        raise RuntimeError(f"Supabase insert {table} failed: {rins.status_code} {rins.text[:300]}")
+        replace_supabase_table(path, df)
+
+
+def replace_supabase_table(path, df):
+    table = TABLE_MAP.get(Path(path).name)
+    if not table:
+        return
+    # Supabase/PostgREST 不能用不存在字段删除；每张表用稳定非空字段清空后重写，避免页面看似提交但数据库没变。
+    del_filter = DELETE_FILTER.get(table, "id=not.is.null")
+    rdel = requests.delete(f"{SUPABASE_URL}/rest/v1/{table}?{del_filter}", headers=SB_HEADERS, timeout=30)
+    if rdel.status_code >= 400:
+        raise RuntimeError(f"Supabase delete {table} failed: {rdel.status_code} {rdel.text[:300]}")
+    append_supabase_rows(path, df)
+
+
+def append_supabase_rows(path, df):
+    table = TABLE_MAP.get(Path(path).name)
+    if not table:
+        return
+    rows = _clean_records(df)
+    if rows:
+        for i in range(0, len(rows), 500):
+            rins = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SB_HEADERS, data=json.dumps(rows[i:i+500], ensure_ascii=False), timeout=30)
+            if rins.status_code >= 400:
+                raise RuntimeError(f"Supabase insert {table} failed: {rins.status_code} {rins.text[:500]}")
 
 
 def classify_category(sheet='', cat='', name=''):
@@ -593,8 +619,15 @@ def bulk_add():
             line = calc_line(r["食材"], r["数量"], r["单位"], r.get("整价", ""))
         new_rows.append(dict(zip(ORDER_COLS, [datetime.now().strftime('%Y%m%d%H%M%S%f'), biz_date, batch, r["食材"], r["数量"], r["单位"], *line])))
     if new_rows:
-        od = pd.concat([od, pd.DataFrame(new_rows)], ignore_index=True)
-        write_csv(ORDERS_CSV, od[ORDER_COLS])
+        new_df = pd.DataFrame(new_rows, columns=ORDER_COLS)
+        if USE_SUPABASE:
+            append_supabase_rows(ORDERS_CSV, new_df[ORDER_COLS])
+            # 本地 CSV 也留一份备份，但不影响线上持久保存。
+            od = pd.concat([od, new_df], ignore_index=True)
+            od.to_csv(ORDERS_CSV, index=False, encoding="utf-8-sig")
+        else:
+            od = pd.concat([od, new_df], ignore_index=True)
+            write_csv(ORDERS_CSV, od[ORDER_COLS])
     return redirect(f"/?date={biz_date}")
 
 
