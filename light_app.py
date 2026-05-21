@@ -114,7 +114,17 @@ def read_csv(path, cols):
     if USE_SUPABASE:
         try:
             table = TABLE_MAP.get(Path(path).name)
+            # app_events 是最终持久层：如果有事件记录，优先从 JSON payload 还原，避免中文列/空值导致传统表写入失败。
             if table:
+                ev = requests.get(f"{SUPABASE_URL}/rest/v1/app_events?table_name=eq.{table}&select=payload", headers=SB_HEADERS, timeout=20)
+                if ev.status_code < 400:
+                    data = [x.get("payload") or {} for x in ev.json()]
+                    if data:
+                        df = pd.DataFrame(data)
+                        for c in cols:
+                            if c not in df.columns:
+                                df[c] = ""
+                        return df[cols].fillna("")
                 r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}?select=*", headers=SB_HEADERS, timeout=20)
                 if r.status_code < 400:
                     data = r.json()
@@ -177,31 +187,29 @@ def replace_supabase_table(path, df):
 
 
 def append_supabase_rows(path, df):
+    # 极简兜底：采购明细/成本库保存失败会直接导致页面“没反应”。
+    # 这里不再依赖 Supabase 表结构是否精确匹配所有中文字段，直接按 JSON 方式写到 app_events，页面读取仍可正常显示。
+    # 如 app_events 尚未建表，则自动回退到原表写入。
     table = TABLE_MAP.get(Path(path).name)
-    if not table:
-        return
     rows = _clean_records(df)
     if not rows:
         return
+    event_rows = []
+    now = datetime.now().isoformat(timespec="seconds")
+    for rec in rows:
+        rid = str(rec.get("记录ID") or rec.get("id") or rec.get("日期") or datetime.now().strftime('%Y%m%d%H%M%S%f'))
+        event_rows.append({"table_name": table or Path(path).stem, "record_key": rid, "payload": rec, "updated_at": now})
+    # 优先写 app_events：字段固定，不怕中文列/数字空值问题。
+    r = requests.post(f"{SUPABASE_URL}/rest/v1/app_events", headers=SB_HEADERS, data=json.dumps(event_rows, ensure_ascii=False), timeout=30)
+    if r.status_code < 400:
+        return
+    # 如果还没建 app_events，则回退原表插入，错误向上抛给 /api/debug_post 看。
+    if not table:
+        raise RuntimeError(f"Supabase app_events insert failed: {r.status_code} {r.text[:500]}")
     for i in range(0, len(rows), 500):
-        chunk = rows[i:i+500]
-        # 第一次按完整字段写；如果数据库表字段类型/字段名和页面数据有冲突，按 Supabase 返回信息自动剔除字段重试，避免测算页 500 没反应。
-        pending = chunk
-        removed = set()
-        for _ in range(8):
-            rins = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SB_HEADERS, data=json.dumps(pending, ensure_ascii=False), timeout=30)
-            if rins.status_code < 400:
-                break
-            msg = rins.text or ""
-            m = re.search(r"column ['\"]?([^'\"\s]+)['\"]? of relation", msg) or re.search(r"Could not find the '([^']+)' column", msg)
-            if m:
-                bad = m.group(1)
-                removed.add(bad)
-                pending = [{k: v for k, v in rec.items() if k not in removed} for rec in chunk]
-                continue
-            raise RuntimeError(f"Supabase insert {table} failed: {rins.status_code} {msg[:500]}")
-        else:
-            raise RuntimeError(f"Supabase insert {table} failed after retry")
+        rins = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SB_HEADERS, data=json.dumps(rows[i:i+500], ensure_ascii=False), timeout=30)
+        if rins.status_code >= 400:
+            raise RuntimeError(f"Supabase insert {table} failed: app_events {r.status_code} {r.text[:300]} / table {rins.status_code} {rins.text[:500]}")
 
 
 def classify_category(sheet='', cat='', name=''):
@@ -1098,7 +1106,14 @@ def logs():
 
 @app.route("/api/health")
 def health():
-    return jsonify({"ok": True, "sku": len(library_df()), "db": "supabase" if USE_SUPABASE else "csv", "version": "supabase-write-v3"})
+    events_ok = False
+    if USE_SUPABASE:
+        try:
+            rr = requests.get(f"{SUPABASE_URL}/rest/v1/app_events?select=id&limit=1", headers=SB_HEADERS, timeout=10)
+            events_ok = rr.status_code < 400
+        except Exception:
+            events_ok = False
+    return jsonify({"ok": True, "sku": len(library_df()), "db": "supabase" if USE_SUPABASE else "csv", "version": "supabase-write-v4-events", "events_ok": events_ok})
 
 
 @app.post("/api/bootstrap_supabase")
@@ -1106,6 +1121,8 @@ def bootstrap_supabase():
     if not USE_SUPABASE:
         return jsonify({"ok": False, "error": "SUPABASE_URL/SUPABASE_SERVICE_KEY not configured"}), 400
     result = {}
+    # 确保最终持久层存在。没有权限走 SQL 时，让梦洁在 Supabase SQL Editor 跑我给的建表 SQL。
+    result["app_events_required"] = "create table if not exists app_events (id bigserial primary key, table_name text not null, record_key text, payload jsonb not null, updated_at timestamptz default now());"
     for path, cols in [(LIB_CSV, LIB_COLS), (ORDERS_CSV, ORDER_COLS), (SALES_CSV, ["日期", "营业额"]), (LOG_CSV, ["时间", "动作", "详情"]), (SUPPLIERS_CSV, SUPPLIER_COLS)]:
         table = TABLE_MAP[Path(path).name]
         df = pd.read_csv(path, dtype={"id": str}).fillna("") if path.exists() else pd.DataFrame(columns=cols)
