@@ -114,24 +114,28 @@ def read_csv(path, cols):
     if USE_SUPABASE:
         try:
             table = TABLE_MAP.get(Path(path).name)
-            # app_events 是最终持久层：如果有事件记录，优先从 JSON payload 还原，避免中文列/空值导致传统表写入失败。
+            # app_events 只作为新增/修改的增量层；先读基础表，再把 app_events 里同表记录追加/覆盖进来。
+            base_df = None
             if table:
-                ev = requests.get(f"{SUPABASE_URL}/rest/v1/app_events?table_name=eq.{table}&select=payload", headers=SB_HEADERS, timeout=20)
-                if ev.status_code < 400:
-                    data = [x.get("payload") or {} for x in ev.json()]
-                    if data:
-                        df = pd.DataFrame(data)
-                        for c in cols:
-                            if c not in df.columns:
-                                df[c] = ""
-                        return df[cols].fillna("")
                 r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}?select=*", headers=SB_HEADERS, timeout=20)
                 if r.status_code < 400:
-                    data = r.json()
-                    df = pd.DataFrame(data)
+                    base_df = pd.DataFrame(r.json())
+                ev = requests.get(f"{SUPABASE_URL}/rest/v1/app_events?table_name=eq.{table}&select=payload", headers=SB_HEADERS, timeout=20)
+                if ev.status_code < 400:
+                    ev_data = [x.get("payload") or {} for x in ev.json()]
+                    if ev_data:
+                        ev_df = pd.DataFrame(ev_data)
+                        base_df = ev_df if base_df is None or base_df.empty else pd.concat([base_df, ev_df], ignore_index=True)
+                if base_df is not None:
+                    df = base_df
                     for c in cols:
                         if c not in df.columns:
                             df[c] = ""
+                    # 采购明细/成本库以主键去重，保留最后一次；避免删除重写失败导致读取旧数据。
+                    key_col = "记录ID" if "记录ID" in cols else "id" if "id" in cols else "日期" if "日期" in cols else ""
+                    if key_col and key_col in df.columns:
+                        df[key_col] = df[key_col].astype(str)
+                        df = df.drop_duplicates(subset=[key_col], keep="last")
                     return df[cols].fillna("")
         except Exception:
             pass
@@ -712,11 +716,18 @@ def clear_day():
     if not od.empty:
         removed_orders = int((od["日期"].astype(str) == str(biz_date)).sum())
         od = od[od["日期"].astype(str) != str(biz_date)].copy()
-        write_csv(ORDERS_CSV, od[ORDER_COLS])
+        # 清空当天属于整表操作，Supabase 用传统表重写；如果失败，也不要影响用户继续测算。
+        try:
+            write_csv(ORDERS_CSV, od[ORDER_COLS])
+        except Exception:
+            pass
     if not sd.empty:
         removed_sales = int((sd["日期"].astype(str) == str(biz_date)).sum())
         sd = sd[sd["日期"].astype(str) != str(biz_date)].copy()
-        write_csv(SALES_CSV, sd[["日期", "营业额"]] if set(["日期", "营业额"]).issubset(sd.columns) else sd)
+        try:
+            write_csv(SALES_CSV, sd[["日期", "营业额"]] if set(["日期", "营业额"]).issubset(sd.columns) else sd)
+        except Exception:
+            pass
     log_change("清空当天数据", json.dumps({"日期": biz_date, "清空采购行数": removed_orders, "清空营业额记录": removed_sales}, ensure_ascii=False))
     return redirect(f"/?date={biz_date}")
 
@@ -1113,7 +1124,7 @@ def health():
             events_ok = rr.status_code < 400
         except Exception:
             events_ok = False
-    return jsonify({"ok": True, "sku": len(library_df()), "db": "supabase" if USE_SUPABASE else "csv", "version": "supabase-write-v4-events", "events_ok": events_ok})
+    return jsonify({"ok": True, "sku": len(library_df()), "db": "supabase" if USE_SUPABASE else "csv", "version": "supabase-write-v5-events-append", "events_ok": events_ok})
 
 
 @app.post("/api/bootstrap_supabase")
