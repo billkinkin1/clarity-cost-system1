@@ -3,12 +3,14 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import re
 import shutil
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
+import requests
 from flask import Flask, jsonify, redirect, render_template_string, request
 
 app = Flask(__name__)
@@ -21,6 +23,23 @@ ORDERS_CSV = DATA_DIR / "orders_light.csv"
 SALES_CSV = DATA_DIR / "sales_light.csv"
 LOG_CSV = DATA_DIR / "library_changes.csv"
 SUPPLIERS_CSV = DATA_DIR / "suppliers.csv"
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_SERVICE_KEY", "").strip()
+USE_SUPABASE = bool(SUPABASE_URL and SUPABASE_KEY)
+SB_HEADERS = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "return=representation",
+}
+TABLE_MAP = {
+    "cost_library.csv": "cost_library",
+    "orders_light.csv": "orders_light",
+    "sales_light.csv": "sales_light",
+    "library_changes.csv": "library_changes",
+    "suppliers.csv": "suppliers",
+}
 
 PREFERRED = [
     PRICING_DIR / "报价库_v6_20260507更新.xlsx",
@@ -84,13 +103,52 @@ def init_library(force=False):
 
 
 def read_csv(path, cols):
+    if USE_SUPABASE:
+        try:
+            table = TABLE_MAP.get(Path(path).name)
+            if table:
+                r = requests.get(f"{SUPABASE_URL}/rest/v1/{table}?select=*", headers=SB_HEADERS, timeout=20)
+                if r.status_code < 400:
+                    data = r.json()
+                    df = pd.DataFrame(data)
+                    for c in cols:
+                        if c not in df.columns:
+                            df[c] = ""
+                    return df[cols].fillna("")
+        except Exception:
+            pass
     if not path.exists():
         return pd.DataFrame(columns=cols)
     return pd.read_csv(path, dtype={"id": str}).fillna("")
 
 
+def _clean_records(df):
+    out = []
+    for rec in df.fillna("").to_dict(orient="records"):
+        clean = {}
+        for k, v in rec.items():
+            if hasattr(v, "item"):
+                v = v.item()
+            if isinstance(v, float) and math.isnan(v):
+                v = ""
+            clean[k] = v
+        out.append(clean)
+    return out
+
+
 def write_csv(path, df):
     df.to_csv(path, index=False, encoding="utf-8-sig")
+    if USE_SUPABASE:
+        table = TABLE_MAP.get(Path(path).name)
+        if table:
+            try:
+                requests.delete(f"{SUPABASE_URL}/rest/v1/{table}?id=neq.__never__", headers=SB_HEADERS, timeout=30)
+                rows = _clean_records(df)
+                if rows:
+                    for i in range(0, len(rows), 500):
+                        requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SB_HEADERS, data=json.dumps(rows[i:i+500], ensure_ascii=False), timeout=30)
+            except Exception:
+                pass
 
 
 def classify_category(sheet='', cat='', name=''):
@@ -980,7 +1038,20 @@ def logs():
 
 @app.route("/api/health")
 def health():
-    return jsonify({"ok": True, "sku": len(library_df())})
+    return jsonify({"ok": True, "sku": len(library_df()), "db": "supabase" if USE_SUPABASE else "csv"})
+
+
+@app.post("/api/bootstrap_supabase")
+def bootstrap_supabase():
+    if not USE_SUPABASE:
+        return jsonify({"ok": False, "error": "SUPABASE_URL/SUPABASE_SERVICE_KEY not configured"}), 400
+    result = {}
+    for path, cols in [(LIB_CSV, LIB_COLS), (ORDERS_CSV, ORDER_COLS), (SALES_CSV, ["日期", "营业额"]), (LOG_CSV, ["时间", "动作", "详情"]), (SUPPLIERS_CSV, SUPPLIER_COLS)]:
+        table = TABLE_MAP[Path(path).name]
+        df = pd.read_csv(path, dtype={"id": str}).fillna("") if path.exists() else pd.DataFrame(columns=cols)
+        write_csv(path, df[cols] if all(c in df.columns for c in cols) else df)
+        result[table] = len(df)
+    return jsonify({"ok": True, "result": result})
 
 
 if __name__ == "__main__":
