@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: mengjie-cost-system
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn light_app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+    disk:
+      name: mengjie-cost-data
+      mountPath: /opt/render/project/src/data
+      sizeGB: 1

@@ -1,0 +1,14 @@
+梦洁姐 Render 部署步骤：
+1. 登录 https://render.com
+2. 点右上角 New +
+3. 选 Web Service
+4. 连接 GitHub 仓库（如果还没有 GitHub，先注册 github.com）
+5. 选择成本系统仓库
+6. 设置：
+   Name: clarity-cost-system
+   Runtime: Python 3
+   Build Command: pip install -r requirements.txt
+   Start Command: gunicorn light_app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120
+7. 点 Create Web Service
+8. 部署完成后，复制 Render 给的 .onrender.com 固定链接发给我
+9. 我再指导你把阿里云 cost.zmjfhf.com 绑定过去
