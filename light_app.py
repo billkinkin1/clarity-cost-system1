@@ -33,6 +33,7 @@ SB_HEADERS = {
     "Content-Type": "application/json",
     "Prefer": "return=representation",
 }
+SCHEMA_CACHE = {}
 TABLE_MAP = {
     "cost_library.csv": "cost_library",
     "orders_light.csv": "orders_light",
@@ -180,11 +181,27 @@ def append_supabase_rows(path, df):
     if not table:
         return
     rows = _clean_records(df)
-    if rows:
-        for i in range(0, len(rows), 500):
-            rins = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SB_HEADERS, data=json.dumps(rows[i:i+500], ensure_ascii=False), timeout=30)
-            if rins.status_code >= 400:
-                raise RuntimeError(f"Supabase insert {table} failed: {rins.status_code} {rins.text[:500]}")
+    if not rows:
+        return
+    for i in range(0, len(rows), 500):
+        chunk = rows[i:i+500]
+        # 第一次按完整字段写；如果数据库表字段类型/字段名和页面数据有冲突，按 Supabase 返回信息自动剔除字段重试，避免测算页 500 没反应。
+        pending = chunk
+        removed = set()
+        for _ in range(8):
+            rins = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SB_HEADERS, data=json.dumps(pending, ensure_ascii=False), timeout=30)
+            if rins.status_code < 400:
+                break
+            msg = rins.text or ""
+            m = re.search(r"column ['\"]?([^'\"\s]+)['\"]? of relation", msg) or re.search(r"Could not find the '([^']+)' column", msg)
+            if m:
+                bad = m.group(1)
+                removed.add(bad)
+                pending = [{k: v for k, v in rec.items() if k not in removed} for rec in chunk]
+                continue
+            raise RuntimeError(f"Supabase insert {table} failed: {rins.status_code} {msg[:500]}")
+        else:
+            raise RuntimeError(f"Supabase insert {table} failed after retry")
 
 
 def classify_category(sheet='', cat='', name=''):
@@ -1081,7 +1098,7 @@ def logs():
 
 @app.route("/api/health")
 def health():
-    return jsonify({"ok": True, "sku": len(library_df()), "db": "supabase" if USE_SUPABASE else "csv"})
+    return jsonify({"ok": True, "sku": len(library_df()), "db": "supabase" if USE_SUPABASE else "csv", "version": "supabase-write-v3"})
 
 
 @app.post("/api/bootstrap_supabase")
