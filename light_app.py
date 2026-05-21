@@ -40,6 +40,13 @@ TABLE_MAP = {
     "library_changes.csv": "library_changes",
     "suppliers.csv": "suppliers",
 }
+DELETE_FILTER = {
+    "cost_library": "id=not.is.null",
+    "orders_light": "%E8%AE%B0%E5%BD%95ID=not.is.null",
+    "sales_light": "%E6%97%A5%E6%9C%9F=not.is.null",
+    "library_changes": "%E6%97%B6%E9%97%B4=not.is.null",
+    "suppliers": "id=not.is.null",
+}
 
 PREFERRED = [
     PRICING_DIR / "报价库_v6_20260507更新.xlsx",
@@ -141,14 +148,17 @@ def write_csv(path, df):
     if USE_SUPABASE:
         table = TABLE_MAP.get(Path(path).name)
         if table:
-            try:
-                requests.delete(f"{SUPABASE_URL}/rest/v1/{table}?id=neq.__never__", headers=SB_HEADERS, timeout=30)
-                rows = _clean_records(df)
-                if rows:
-                    for i in range(0, len(rows), 500):
-                        requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SB_HEADERS, data=json.dumps(rows[i:i+500], ensure_ascii=False), timeout=30)
-            except Exception:
-                pass
+            # Supabase/PostgREST 不能用不存在字段删除；每张表用稳定非空字段清空后重写，避免页面看似提交但数据库没变。
+            del_filter = DELETE_FILTER.get(table, "id=not.is.null")
+            rdel = requests.delete(f"{SUPABASE_URL}/rest/v1/{table}?{del_filter}", headers=SB_HEADERS, timeout=30)
+            if rdel.status_code >= 400:
+                raise RuntimeError(f"Supabase delete {table} failed: {rdel.status_code} {rdel.text[:300]}")
+            rows = _clean_records(df)
+            if rows:
+                for i in range(0, len(rows), 500):
+                    rins = requests.post(f"{SUPABASE_URL}/rest/v1/{table}", headers=SB_HEADERS, data=json.dumps(rows[i:i+500], ensure_ascii=False), timeout=30)
+                    if rins.status_code >= 400:
+                        raise RuntimeError(f"Supabase insert {table} failed: {rins.status_code} {rins.text[:300]}")
 
 
 def classify_category(sheet='', cat='', name=''):
