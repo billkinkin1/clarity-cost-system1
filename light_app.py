@@ -291,23 +291,36 @@ def ensure_library_price_from_order(row, price):
 
 def parse_bulk_text(text):
     rows = []
+    # 支持“半件/半包/半斤”等口述；也支持瓶、罐等调料常见单位。
+    unit_pat = r"斤|件|包|个|袋|板|盒|桶|瓶|罐|条|只"
     for raw in str(text or "").splitlines():
         line = raw.strip()
         if not line or re.search(r"营业额|销售额", line):
             continue
+        # 跳过类似“富临店（5月21号）”这种抬头，不当成食材。
+        if re.search(r"店", line) and re.search(r"\d+\s*月\s*\d+\s*号?", line):
+            continue
         line = line.replace("：", ":").replace("，", ",")
-        m = re.search(r"(.+?)\s*([0-9]+(?:\.[0-9]+)?)\s*(斤|件|包|个|袋|板|盒|桶|条|只)", line)
+        m_half = re.search(rf"(.+?)\s*半\s*({unit_pat})", line)
+        if m_half:
+            unit = m_half.group(2)
+            if unit in ["条", "只"]:
+                unit = "个"
+            rows.append({"食材": m_half.group(1).strip(" ,-，:：（("), "数量": 0.5, "单位": unit, "整价": "", "原文": raw})
+            continue
+        m = re.search(rf"(.+?)\s*([0-9]+(?:\.[0-9]+)?)\s*({unit_pat})", line)
         if not m:
             m2 = re.search(r"(.+?)\s*([0-9]+(?:\.[0-9]+)?)\s*元?$", line)
             if m2:
                 rows.append({"食材": m2.group(1).strip(" ,-，:："), "数量": 1.0, "单位": "整项", "整价": float(m2.group(2)), "原文": raw})
             else:
-                rows.append({"食材": line, "数量": "", "单位": "待识别", "整价": "", "原文": raw})
+                # 不认识的也保留到计算过程里，方便梦洁姐看见后补数量/单价或删除。
+                rows.append({"食材": line, "数量": 1.0, "单位": "待确认", "整价": "", "原文": raw})
             continue
         unit = m.group(3)
         if unit in ["条", "只"]:
             unit = "个"
-        rows.append({"食材": m.group(1).strip(" ,-，:："), "数量": float(m.group(2)), "单位": unit, "整价": "", "原文": raw})
+        rows.append({"食材": m.group(1).strip(" ,-，:：（("), "数量": float(m.group(2)), "单位": unit, "整价": "", "原文": raw})
     return rows
 
 
@@ -465,6 +478,11 @@ def index():
     summary = calc_summary(biz_date)
     od = orders_df()
     today = od[od["日期"].astype(str) == str(biz_date)].tail(200) if not od.empty else od
+    if not today.empty:
+        _cat_order = {"蔬菜": 1, "猪肉": 2, "冻品": 3, "米油蛋": 4, "调料": 5, "海鲜/整价": 6, "其他": 7}
+        today = today.copy()
+        today["_批次排序"] = today["批次"].map(_cat_order).fillna(99)
+        today = today.sort_values(["_批次排序", "批次", "食材"]).drop(columns=["_批次排序"], errors="ignore")
     rows = build_calc_process_rows(today)
     batch_rows = batch_summary_rows(today)
     review = day_review_rows(biz_date)
@@ -502,8 +520,9 @@ def bulk_add():
     new_rows = []
     for r in parse_bulk_text(text):
         if r["单位"] == "待识别" or r["数量"] == "":
-            continue
-        line = calc_line(r["食材"], r["数量"], r["单位"], r.get("整价", ""))
+            line = (r["数量"], r["单位"] or "待确认", math.nan, math.nan, "⚠️ 单位待确认", "-", "", "未识别数量单位，请补单价或删除")
+        else:
+            line = calc_line(r["食材"], r["数量"], r["单位"], r.get("整价", ""))
         new_rows.append(dict(zip(ORDER_COLS, [datetime.now().strftime('%Y%m%d%H%M%S%f'), biz_date, batch, r["食材"], r["数量"], r["单位"], *line])))
     if new_rows:
         od = pd.concat([od, pd.DataFrame(new_rows)], ignore_index=True)
