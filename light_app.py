@@ -274,22 +274,18 @@ def library_df():
 
 
 def orders_df():
-    df = read_csv(ORDERS_CSV, ORDER_COLS)
+      df = read_csv(ORDERS_CSV, ORDER_COLS)
     if '记录ID' not in df.columns:
-        df.insert(0, '记录ID', '')
-    # 兼容旧数据：以前没有记录ID，这里自动补上，方便单行删除。
-    changed = False
-    for i in df.index:
-        if not str(df.at[i, '记录ID']).strip():
-            df.at[i, '记录ID'] = datetime.now().strftime('%Y%m%d%H%M%S%f') + f'_{i}'
-            changed = True
-    for c in ORDER_COLS:
-        if c not in df.columns:
-            df[c] = ''
-    df = df[ORDER_COLS]
-    if changed:
-        write_csv(ORDERS_CSV, df)
-    return df
+          df.insert(0, '记录ID', '')
+     # 兼容旧数据：以前没有记录ID，只在内存里补，不在首页读取时写回 Supabase，避免首页 500。
+      for i in df.index:
+          if not str(df.at[i, '记录ID']).strip():
+             df.at[i, '记录ID'] = datetime.now().strftime('%Y%m%d%H%M%S%f') + f'_{i}'
+      for c in ORDER_COLS:
+          if c not in df.columns:
+             df[c] = ''
+     df = df[ORDER_COLS]
+     return df
 
 
 def sales_df():
